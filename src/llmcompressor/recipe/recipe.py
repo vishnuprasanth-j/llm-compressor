@@ -23,6 +23,74 @@ __all__ = [
 ]
 
 
+def _validate_awq_quantization_stacking(modifiers: List[Modifier]) -> None:
+    """
+    Validate that AWQModifier is properly stacked with a quantization modifier.
+
+    AWQModifier performs smoothing only and requires a quantization modifier
+    (QuantizationModifier or GPTQModifier) to be present in the recipe for
+    full quantization support. This validation warns if AWQModifier is used
+    without a subsequent quantization modifier.
+
+    :param modifiers: List of modifiers in the recipe
+    """
+    from llmcompressor.modifiers.awq import AWQModifier
+    from llmcompressor.modifiers.quantization import QuantizationModifier
+    from llmcompressor.modifiers.quantization.gptq import GPTQModifier
+
+    # Find AWQModifier and quantization modifiers with their indices
+    awq_index = None
+    awq_modifier = None
+    quant_index = None
+    quant_modifier = None
+
+    for idx, modifier in enumerate(modifiers):
+        if isinstance(modifier, AWQModifier):
+            awq_index = idx
+            awq_modifier = modifier
+        elif isinstance(modifier, (QuantizationModifier, GPTQModifier)):
+            if quant_index is None:  # take first one
+                quant_index = idx
+                quant_modifier = modifier
+
+    # Return early if no AWQModifier
+    if awq_index is None:
+        return
+
+    # Warn if AWQModifier is used without a quantization modifier
+    if quant_modifier is None:
+        logger.warning(
+            "AWQModifier is being used without a quantization modifier. "
+            "The model will be smoothed but not quantized. "
+            "Consider stacking AWQModifier with QuantizationModifier or GPTQModifier "
+            "for full quantization support. Example: "
+            "recipe = [AWQModifier(...), QuantizationModifier(...)]"
+        )
+        return
+
+    # Raise error if AWQModifier comes after quantization modifier (wrong order)
+    # This is a hard requirement - wrong ordering will silently produce a bad model
+    if awq_index > quant_index:
+        raise ValueError(
+            f"AWQModifier (index {awq_index}) must come BEFORE the quantization "
+            f"modifier (index {quant_index}) in the recipe. "
+            "AWQ smoothing must be applied before quantization. Example: "
+            "recipe = [AWQModifier(...), QuantizationModifier(...)]"
+        )
+
+    # Validate that ignore lists match between AWQ and quantization modifier
+    awq_ignore = set(awq_modifier.ignore or [])
+    quant_ignore = set(getattr(quant_modifier, "ignore", None) or [])
+
+    if awq_ignore != quant_ignore:
+        logger.warning(
+            f"AWQModifier.ignore {awq_ignore} does not match "
+            f"quantization modifier ignore {quant_ignore}. "
+            "This may cause AWQ to smooth layers that won't be quantized, "
+            "or skip layers that will be quantized. Consider aligning these."
+        )
+
+
 class Recipe(BaseModel):
     """
     A class to represent a recipe for a model.
@@ -72,6 +140,9 @@ class Recipe(BaseModel):
 
         if any(not isinstance(modifier, Modifier) for modifier in modifiers):
             raise ValueError("modifiers must be a list of Modifier instances")
+
+        # Validate AWQ+Quantization stacking
+        _validate_awq_quantization_stacking(modifiers)
 
         group_name = modifier_group_name or "default"
 
@@ -191,6 +262,9 @@ class Recipe(BaseModel):
                                 **mod_args,
                             )
                             modifiers.append(modifier)
+
+        # Validate AWQ+Quantization stacking
+        _validate_awq_quantization_stacking(modifiers)
 
         return Recipe(
             args=args,

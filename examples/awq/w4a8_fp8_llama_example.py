@@ -4,6 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.awq import AWQModifier
+from llmcompressor.modifiers.quantization import QuantizationModifier
 
 # Select model and load it.
 MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
@@ -37,15 +38,13 @@ def preprocess(example):
 ds = ds.map(preprocess)
 
 # Configure the quantization algorithm to run.
+# AWQModifier performs smoothing only and should be stacked with
+# QuantizationModifier for full quantization support.
 # W4AFP8 scheme: 4-bit integer weights (group 128) + FP8 dynamic per-token activations
 # AWQ smooths the weights before quantization to reduce quantization error.
 recipe = [
-    AWQModifier(
-        ignore=["lm_head"],
-        scheme="W4AFP8",
-        targets=["Linear"],
-        duo_scaling=True,
-    ),
+    AWQModifier(ignore=["lm_head"], targets=["Linear"], duo_scaling=True),
+    QuantizationModifier(targets=["Linear"], scheme="W4AFP8", ignore=["lm_head"]),
 ]
 
 # Apply algorithms.

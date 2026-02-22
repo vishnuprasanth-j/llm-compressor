@@ -26,7 +26,6 @@ def test_awq_is_registered():
         type_="AWQModifier",
         allow_experimental=False,
         allow_registered=True,
-        scheme="W4A16_ASYM",
     )
 
     assert isinstance(modifier, AWQModifier), "AWQModifier not registered"
@@ -46,7 +45,7 @@ def test_set_resolved_mappings():
                 ["re:.*down_proj"],
             ),
         ],
-        scheme="W4A16_ASYM",
+        targets=["Linear"],
     )
     self_attn = torch.nn.ModuleDict(
         {
@@ -115,7 +114,7 @@ def test_set_resolved_mappings():
             # make sure we exclude mapping if any balance layers are skipped
             AWQMapping("re:.*v_proj", ["re:.*z_proj", "re:.*o_proj"]),
         ],
-        scheme="W4A16_ASYM",
+        targets=["Linear"],
     )
     model = torch.nn.ModuleDict(
         {
@@ -150,11 +149,11 @@ def test_set_resolved_mappings():
 
 @pytest.mark.unit
 def test_validate():
-    AWQModifier(scheme="W4A16", duo_scaling="both")
+    AWQModifier(duo_scaling="both")
     with pytest.raises(ValidationError):
-        AWQModifier(scheme="W4A16", duo_scaling="Both")
+        AWQModifier(duo_scaling="Both")
     with pytest.raises(ValidationError):
-        AWQModifier(scheme="W4A16", duo_scaling="x")
+        AWQModifier(duo_scaling="x")
 
 
 @pytest.mark.unit
@@ -170,7 +169,7 @@ def test_ignore_behavior():
             ),
         ],
         ignore=["re:.*q_proj", "re:.*k_proj"],  # Only 2 of 3 balance layers ignored
-        scheme="W4A16_ASYM",
+        targets=["Linear"],
     )
 
     self_attn = torch.nn.ModuleDict(
@@ -206,7 +205,7 @@ def test_ignore_behavior():
             ),
         ],
         ignore=["re:.*q_proj", "re:.*k_proj", "re:.*v_proj"],
-        scheme="W4A16_ASYM",
+        targets=["Linear"],
     )
 
     awq2._set_resolved_mappings(model)
@@ -227,7 +226,7 @@ def test_moe_multiple_balance_layers():
                 ["re:.*gate_proj", "re:.*up_proj"],
             ),
         ],
-        scheme="W4A16_ASYM",
+        targets=["Linear"],
     )
 
     # Create a simplified MoE model structure
@@ -299,7 +298,7 @@ def test_qwen3_next_moe_with_shared_expert():
                 ],
             ),
         ],
-        scheme="W4A16_ASYM",
+        targets=["Linear"],
     )
 
     # Create a Qwen3Next-like MoE model structure with shared_expert
@@ -387,7 +386,7 @@ def test_qwen3_next_hybrid_attention():
             ),
             AWQMapping("re:.*linear_attn.norm$", ["re:.*linear_attn.out_proj$"]),
         ],
-        scheme="W4A16_ASYM",
+        targets=["Linear"],
     )
 
     # Create a Qwen3Next-like model with both self_attn and linear_attn layers
@@ -675,3 +674,75 @@ def test_block_strategy_compute_layer_means(rows, cols, block_height, block_widt
     # check
     assert_close(llmc_awq_means, ref_means, atol=1e-5, rtol=1e-5)
     assert_close(llmc_awq_means, auto_awq_means, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.unit
+def test_standalone_warning():
+    """AWQModifier warns when used without quantization modifier"""
+    from llmcompressor.recipe.recipe import _validate_awq_quantization_stacking
+
+    awq = AWQModifier(
+        mappings=[
+            AWQMapping("re:.*layernorm", ["re:.*q_proj"]),
+        ]
+    )
+
+    # This should trigger the warning but not raise
+    _validate_awq_quantization_stacking([awq])
+
+
+@pytest.mark.unit
+def test_no_warning_when_stacked():
+    """No warning when AWQModifier is properly stacked"""
+    from llmcompressor.modifiers.quantization import QuantizationModifier
+    from llmcompressor.recipe.recipe import _validate_awq_quantization_stacking
+
+    awq = AWQModifier(
+        mappings=[
+            AWQMapping("re:.*layernorm", ["re:.*q_proj"]),
+        ]
+    )
+    quant = QuantizationModifier(targets="Linear", scheme="W4A16")
+
+    # This should not trigger any warnings
+    _validate_awq_quantization_stacking([awq, quant])
+
+
+@pytest.mark.unit
+def test_ordering_error():
+    """Error when AWQModifier comes after quantization modifier"""
+    from llmcompressor.modifiers.quantization import QuantizationModifier
+    from llmcompressor.recipe.recipe import _validate_awq_quantization_stacking
+
+    awq = AWQModifier(
+        mappings=[
+            AWQMapping("re:.*layernorm", ["re:.*q_proj"]),
+        ]
+    )
+    quant = QuantizationModifier(targets="Linear", scheme="W4A16")
+
+    # This should raise a ValueError for wrong ordering
+    with pytest.raises(ValueError, match="must come BEFORE"):
+        _validate_awq_quantization_stacking([quant, awq])  # Wrong order!
+
+
+@pytest.mark.unit
+def test_mismatched_ignore_warning():
+    """Warn when AWQ and quant modifier have mismatched ignore lists"""
+    from llmcompressor.modifiers.quantization import QuantizationModifier
+    from llmcompressor.recipe.recipe import _validate_awq_quantization_stacking
+
+    awq = AWQModifier(
+        mappings=[
+            AWQMapping("re:.*layernorm", ["re:.*q_proj"]),
+        ],
+        ignore=["lm_head"],
+    )
+    quant = QuantizationModifier(
+        targets="Linear",
+        scheme="W4A16",
+        ignore=["lm_head", "embed_tokens"],  # different!
+    )
+
+    # Should warn but not raise
+    _validate_awq_quantization_stacking([awq, quant])

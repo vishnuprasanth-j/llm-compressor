@@ -5,6 +5,7 @@ from transformers import AutoProcessor, Qwen3VLMoeForConditionalGeneration
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.awq import AWQModifier
+from llmcompressor.modifiers.quantization import QuantizationModifier
 
 MODEL_ID = "Qwen/Qwen3-VL-30B-A3B-Instruct"
 
@@ -61,36 +62,41 @@ def data_collator(batch):
 
 
 # Configure AWQ quantization with smoothing and balancing
+# AWQModifier performs smoothing only and should be stacked with
+# QuantizationModifier for full quantization support.
 # NOTE: This recipe uses W4A16 quantization with group_size=32
 # rather than the default preset with group_size=128
-recipe = AWQModifier(
-    ignore=[
-        "re:.*embed_tokens",
-        "re:.*input_layernorm$",
-        "re:.*mlp[.]gate$",
-        "re:.*post_attention_layernorm$",
-        "re:.*norm$",
-        "re:model[.]visual.*",
-        "re:visual.*",
-        "lm_head",
-    ],
-    duo_scaling=True,
-    config_groups={
-        "group_0": {
-            "targets": ["Linear"],
-            "weights": {
-                "num_bits": 4,
-                "type": "int",
-                "symmetric": True,
-                "group_size": 32,
-                "strategy": "group",
-                "dynamic": False,
-                "actorder": None,
-                "observer": "mse",
-            },
-        }
-    },
-)
+ignore_layers = [
+    "re:.*embed_tokens",
+    "re:.*input_layernorm$",
+    "re:.*mlp[.]gate$",
+    "re:.*post_attention_layernorm$",
+    "re:.*norm$",
+    "re:model[.]visual.*",
+    "re:visual.*",
+    "lm_head",
+]
+
+recipe = [
+    AWQModifier(ignore=ignore_layers, duo_scaling=True, targets=["Linear"]),
+    QuantizationModifier(
+        targets=["Linear"],
+        ignore=ignore_layers,
+        config_groups={
+            "group_0": {
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                    "symmetric": True,
+                    "group_size": 32,
+                    "strategy": "group",
+                    "dynamic": False,
+                    "observer": "mse",
+                },
+            }
+        },
+    ),
+]
 
 # Apply AWQ quantization.
 oneshot(

@@ -1,3 +1,4 @@
+import torch
 from compressed_tensors.offload import dispatch_model
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -6,22 +7,33 @@ from llmcompressor import oneshot
 from llmcompressor.modifiers.awq import AWQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
 
-# Select model and load it.
-MODEL_ID = "Qwen/Qwen3-Next-80B-A3B-Thinking"
+# Verify GPU is available
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto")
+# Select small open model (no auth required)
+MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+
+print(f"\nLoading model: {MODEL_ID}")
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    torch_dtype="auto",
+    device_map="auto",
+)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
-# Select calibration dataset.
+# Select calibration dataset
 DATASET_ID = "HuggingFaceH4/ultrachat_200k"
 DATASET_SPLIT = "train_sft"
 
-# Select number of samples. 256 samples is a good place to start.
-# Increasing the number of samples can improve accuracy.
-NUM_CALIBRATION_SAMPLES = 256
-MAX_SEQUENCE_LENGTH = 512
+# Use fewer samples for faster testing
+NUM_CALIBRATION_SAMPLES = 32
+MAX_SEQUENCE_LENGTH = 256
 
-# Load dataset and preprocess.
+# Load dataset and preprocess
+print(f"\nLoading dataset: {DATASET_ID}")
 ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
 ds = ds.shuffle(seed=42)
 
@@ -38,7 +50,6 @@ def preprocess(example):
 ds = ds.map(preprocess)
 
 
-# Tokenize inputs.
 def tokenize(sample):
     return tokenizer(
         sample["text"],
@@ -49,23 +60,20 @@ def tokenize(sample):
     )
 
 
-# Configure the quantization algorithm to run.
+ds = ds.map(tokenize, remove_columns=ds.column_names)
+
+# Configure the quantization algorithm
 # AWQModifier performs smoothing only and should be stacked with
 # QuantizationModifier for full quantization support.
-# NOTE: vllm currently does not support asym MoE, using symmetric here
+# Use duo_scaling=True 
+print("\nConfiguring AWQ + QuantizationModifier recipe...")
 recipe = [
-    AWQModifier(
-        ignore=["lm_head", "re:.*mlp.gate$", "re:.*mlp.shared_expert_gate$"],
-        targets=["Linear"],
-    ),
-    QuantizationModifier(
-        targets=["Linear"],
-        scheme="W4A16",
-        ignore=["lm_head", "re:.*mlp.gate$", "re:.*mlp.shared_expert_gate$"],
-    ),
+    AWQModifier(ignore=["lm_head"], targets=["Linear"], duo_scaling="both"),
+    QuantizationModifier(targets=["Linear"], scheme="W4A16_ASYM", ignore=["lm_head"]),
 ]
 
-# Apply algorithms.
+# Apply algorithms
+print("\nRunning oneshot quantization...")
 oneshot(
     model=model,
     dataset=ds,
@@ -74,18 +82,21 @@ oneshot(
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
 )
 
-# Confirm generations of the quantized model look sane.
+
 print("\n\n")
 print("========== SAMPLE GENERATION ==============")
 dispatch_model(model)
 input_ids = tokenizer("Hello my name is", return_tensors="pt").input_ids.to(
     model.device
 )
-output = model.generate(input_ids, max_new_tokens=100)
+output = model.generate(input_ids, max_new_tokens=50)
 print(tokenizer.decode(output[0]))
 print("==========================================\n\n")
 
-# Save to disk compressed.
-SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-awq-sym"
+# Save to disk compressed
+SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-awq-test"
+print(f"Saving model to: {SAVE_DIR}")
 model.save_pretrained(SAVE_DIR, save_compressed=True)
 tokenizer.save_pretrained(SAVE_DIR)
+
+print("\nAWQ test completed successfully!")

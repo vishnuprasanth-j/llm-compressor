@@ -6,13 +6,19 @@ The AWQ implementation found in LLM Compressor is derived from the pioneering wo
 
 ## AWQ Recipe ##
 
-The AWQ recipe has been inferfaced as follows, where the `AWQModifier` adjusts model scales ahead of efficient weight quantization by the `QuantizationModifier`
+The `AWQModifier` performs smoothing only and should be stacked with a `QuantizationModifier` for full quantization support. The `AWQModifier` adjusts model scales ahead of efficient weight quantization by the `QuantizationModifier`:
 
 ```python
+from llmcompressor.modifiers.awq import AWQModifier
+from llmcompressor.modifiers.quantization import QuantizationModifier
+
 recipe = [
-    AWQModifier(ignore=["lm_head"], scheme="W4A16_ASYM", targets=["Linear"]),
+    AWQModifier(ignore=["lm_head"], targets=["Linear"]),
+    QuantizationModifier(targets=["Linear"], scheme="W4A16_ASYM", ignore=["lm_head"]),
 ]
 ```
+
+**Note:** Using `AWQModifier` without a quantization modifier will result in a warning, as the model will be smoothed but not quantized.
 
 ## Compressing Your Own Model ##
 To use your own model, start with an existing example change the `model_id` to match your own model stub.
