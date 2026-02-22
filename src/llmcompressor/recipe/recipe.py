@@ -29,8 +29,12 @@ def _validate_awq_quantization_stacking(modifiers: List[Modifier]) -> None:
 
     AWQModifier performs smoothing only and requires a quantization modifier
     (QuantizationModifier or GPTQModifier) to be present in the recipe for
-    full quantization support. This validation warns if AWQModifier is used
-    without a subsequent quantization modifier.
+    full quantization support. This validation:
+
+    1. Warns if AWQModifier is used without a subsequent quantization modifier
+    2. Raises an error if AWQModifier comes after the quantization modifier
+    3. Validates that scheme/config_groups match between AWQModifier and the
+       subsequent quantization modifier (if AWQModifier has a scheme specified)
 
     :param modifiers: List of modifiers in the recipe
     """
@@ -88,6 +92,52 @@ def _validate_awq_quantization_stacking(modifiers: List[Modifier]) -> None:
             f"quantization modifier ignore {quant_ignore}. "
             "This may cause AWQ to smooth layers that won't be quantized, "
             "or skip layers that will be quantized. Consider aligning these."
+        )
+
+    # Validate that scheme/config_groups match between AWQ and quantization modifier
+    # This is critical for correct quantization simulation during AWQ grid search
+    awq_scheme = getattr(awq_modifier, "scheme", None)
+    awq_config_groups = getattr(awq_modifier, "config_groups", None)
+    quant_scheme = getattr(quant_modifier, "scheme", None)
+    quant_config_groups = getattr(quant_modifier, "config_groups", None)
+
+    # If AWQModifier has a scheme specified, it must match the quantization modifier
+    if awq_scheme is not None or awq_config_groups is not None:
+        # Both have scheme or config_groups - validate they match
+        if awq_scheme is not None and quant_scheme is not None:
+            if awq_scheme != quant_scheme:
+                raise ValueError(
+                    f"AWQModifier.scheme '{awq_scheme}' does not match "
+                    f"quantization modifier scheme '{quant_scheme}'. "
+                    "The AWQ grid search quantization simulation must use the same "
+                    "scheme as the subsequent quantization modifier. "
+                    "Please ensure both modifiers have matching scheme values."
+                )
+        elif awq_config_groups is not None and quant_config_groups is not None:
+            # Compare config_groups - this is more complex, so we do a basic check
+            awq_group_keys = set(awq_config_groups.keys())
+            quant_group_keys = set(quant_config_groups.keys())
+            if awq_group_keys != quant_group_keys:
+                raise ValueError(
+                    f"AWQModifier.config_groups keys {awq_group_keys} do not match "
+                    f"quantization modifier config_groups keys {quant_group_keys}. "
+                    "The AWQ grid search quantization simulation must use the same "
+                    "config_groups as the subsequent quantization modifier."
+                )
+        else:
+            # One has scheme, other has config_groups - warn about potential mismatch
+            logger.warning(
+                "AWQModifier uses 'scheme' while quantization modifier uses "
+                "'config_groups' (or vice versa). Please ensure they define "
+                "the same quantization parameters for correct AWQ grid search."
+            )
+    else:
+        # AWQModifier has no scheme - warn that grid search will be FP-only
+        logger.info(
+            "AWQModifier does not have a 'scheme' specified. The AWQ grid search "
+            "will run in FP-only mode without quantization simulation. "
+            "For best results, provide a 'scheme' argument to AWQModifier that "
+            "matches your quantization modifier's scheme."
         )
 
 

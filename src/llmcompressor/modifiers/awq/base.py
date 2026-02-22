@@ -1,13 +1,15 @@
-import contextlib
 import inspect
 from itertools import product
-from typing import Iterator, Literal, Set
+from typing import Any, Dict, Iterator, List, Literal, Optional, Set, Union
 
 import torch
 from compressed_tensors.quantization import (
+    QuantizationArgs,
+    QuantizationScheme,
     QuantizationStrategy,
     disable_quantization,
-    forward_quantize,
+    is_preset_scheme,
+    preset_name_to_scheme,
 )
 from compressed_tensors.utils import (
     align_modules,
@@ -16,7 +18,6 @@ from compressed_tensors.utils import (
     getattr_chain,
     match_modules_set,
     match_named_modules,
-    patch_attrs,
     update_offload_parameter,
 )
 from loguru import logger
@@ -32,11 +33,8 @@ from llmcompressor.modifiers.awq.mappings import (
     ResolvedMapping,
     get_layer_mappings_from_architecture,
 )
-from llmcompressor.modifiers.quantization.calibration import call_observer
-from llmcompressor.modifiers.utils import update_fused_layer_weight_global_scales
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.modifiers.utils.pytorch_helpers import is_moe_model
-from llmcompressor.observers.base import Observer
 from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.sentinel import Sentinel
 from llmcompressor.utils.helpers import calibration_forward_context
@@ -44,7 +42,125 @@ from llmcompressor.utils.pytorch.module import (
     get_module_to_name_dict,
 )
 
-__all__ = ["AWQModifier"]
+__all__ = ["AWQModifier", "pseudo_quantize_tensor"]
+
+
+def pseudo_quantize_tensor(
+    weight: torch.Tensor,
+    weight_args: QuantizationArgs,
+) -> torch.Tensor:
+    """
+    Pure mathematical simulation of quantization without using PyTorch Observers.
+    This simulates the rounding/clamping error that occurs during quantization
+    based on the quantization args (bit_width, group_size, strategy, symmetric).
+
+    :param weight: The weight tensor to pseudo-quantize
+    :param weight_args: QuantizationArgs containing bit_width, group_size, strategy, etc.
+    :return: Pseudo-quantized weight tensor (still in float, but with quantization error)
+    """
+    if weight_args is None:
+        return weight
+
+    orig_shape = weight.shape
+    orig_dtype = weight.dtype
+
+    # Get quantization parameters
+    bit_width = weight_args.num_bits
+    symmetric = weight_args.symmetric
+
+    # Handle different quantization strategies
+    strategy = weight_args.strategy
+
+    if strategy == QuantizationStrategy.TENSOR:
+        # Entire tensor quantized together
+        chunk_size = weight.numel()
+        weight = weight.reshape(-1, chunk_size)
+
+    elif strategy == QuantizationStrategy.CHANNEL:
+        # Per output channel quantization
+        chunk_size = weight.size(1)
+        weight = weight.reshape(weight.size(0), -1)
+
+    elif strategy in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP):
+        # Group quantization
+        group_size = weight_args.group_size
+        if group_size is None or group_size <= 0:
+            # Fallback to per-tensor if group_size not specified
+            group_size = weight.numel()
+        chunk_size = group_size
+        # Reshape to (num_groups, group_size)
+        if weight.numel() % chunk_size != 0:
+            # If not divisible, pad with zeros (will be removed after quantization)
+            pad_size = chunk_size - (weight.numel() % chunk_size)
+            weight = torch.nn.functional.pad(weight.reshape(-1), (0, pad_size))
+        weight = weight.reshape(-1, chunk_size)
+
+    elif strategy == QuantizationStrategy.BLOCK:
+        # Block quantization
+        block_height, block_width = weight_args.block_structure
+        weight = (
+            weight.unflatten(0, (-1, block_height))
+            .unflatten(-1, (-1, block_width))
+            .transpose(1, 2)
+        )
+        chunk_size = block_height * block_width
+        weight = weight.reshape(-1, chunk_size)
+
+    else:
+        # Unknown strategy, return unchanged
+        return weight
+
+    # Compute scale and zero-point per chunk
+    if symmetric:
+        # Symmetric quantization: scale = max_abs / (2^(bits-1) - 1)
+        max_abs = weight.abs().amax(dim=1, keepdim=True)
+        scale = max_abs / (2 ** (bit_width - 1) - 1)
+        scale = scale.clamp(min=1e-8)  # Avoid division by zero
+        zero_point = torch.zeros_like(scale)
+    else:
+        # Asymmetric quantization
+        min_val = weight.amin(dim=1, keepdim=True)
+        max_val = weight.amax(dim=1, keepdim=True)
+        qmin = 0
+        qmax = 2**bit_width - 1
+        scale = (max_val - min_val) / (qmax - qmin)
+        scale = scale.clamp(min=1e-8)  # Avoid division by zero
+        zero_point = qmin - min_val / scale
+        zero_point = zero_point.round().clamp(qmin, qmax)
+
+    # Quantize: q = round(w / scale) + zp
+    q_weight = (weight / scale).round() + zero_point
+
+    # Clamp to valid range
+    if symmetric:
+        qmin = -(2 ** (bit_width - 1))
+        qmax = 2 ** (bit_width - 1) - 1
+    else:
+        qmin = 0
+        qmax = 2**bit_width - 1
+    q_weight = q_weight.clamp(qmin, qmax)
+
+    # Dequantize: w' = (q - zp) * scale
+    dequant_weight = (q_weight - zero_point) * scale
+
+    # Reshape back to original shape
+    if strategy == QuantizationStrategy.CHANNEL:
+        dequant_weight = dequant_weight.reshape(orig_shape)
+    elif strategy in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP):
+        dequant_weight = dequant_weight.reshape(-1)[: orig_shape.numel()].reshape(
+            orig_shape
+        )
+    elif strategy == QuantizationStrategy.BLOCK:
+        # Reverse the block reshaping
+        num_blocks_h = orig_shape[0] // weight_args.block_structure[0]
+        num_blocks_w = orig_shape[1] // weight_args.block_structure[1]
+        dequant_weight = dequant_weight.reshape(
+            num_blocks_h, num_blocks_w, weight_args.block_structure[0], weight_args.block_structure[1]
+        ).transpose(1, 2).reshape(orig_shape)
+    else:
+        dequant_weight = dequant_weight.reshape(orig_shape)
+
+    return dequant_weight.to(orig_dtype)
 
 
 class AWQModifier(Modifier):
@@ -78,16 +194,22 @@ class AWQModifier(Modifier):
           balance_layers: ["re:.*fc1"]
       ignore: ["lm_head"]
       duo_scaling: true
+      scheme: W4A16_ASYM
     QuantizationModifier:
       targets: ["Linear"]
       scheme: W4A16_ASYM
       ignore: ["lm_head"]
     ```
 
+    IMPORTANT: When stacking AWQModifier with QuantizationModifier or GPTQModifier,
+    the `scheme` (or `config_groups`) must match exactly between the two modifiers.
+    This is validated at recipe creation time.
+
     Lifecycle:
 
     - on_initialize
         - resolve mappings
+        - resolve scheme to _weight_args for quantization simulation
         - capture kwargs needed for forward passes into modules
     - on_start
         - set up activation cache hooks to capture input activations
@@ -138,6 +260,14 @@ class AWQModifier(Modifier):
         this specifies how many grid points should be used. To decrease the runtime,
         at the possible cost of slightly worse scales, this can be decreased.
         Defaults to 20
+    :param scheme: a quantization scheme to use for the grid search simulation.
+        This should match the scheme used in the subsequent QuantizationModifier
+        or GPTQModifier. Can be a preset scheme name (e.g., "W4A16_ASYM") or a
+        dictionary specifying the scheme. If None, the grid search will use
+        FP-only smoothing without quantization simulation.
+    :param config_groups: alternative to scheme, allows specifying quantization
+        config groups directly. Must match the config_groups of the subsequent
+        quantization modifier if stacked.
     """
 
     # Allow arbitrary types because AWQMapping has fields of type torch.nn.Module
@@ -151,6 +281,9 @@ class AWQModifier(Modifier):
     offload_device: torch.device | None | Sentinel = Sentinel("not_provided")
     duo_scaling: bool | Literal["both"] = True
     n_grid: int = 20
+    # Quantization scheme for grid search simulation
+    scheme: Optional[Union[str, Dict[str, Any]]] = None
+    config_groups: Optional[Dict[str, QuantizationScheme]] = None
 
     # Private vars set during initialization, cleared during finalization
     _resolved_mappings: list[ResolvedMapping] = PrivateAttr(default_factory=list)
@@ -164,6 +297,8 @@ class AWQModifier(Modifier):
     )
     # List to store error metrics for each layer
     _error_metrics: list[dict] = PrivateAttr(default_factory=list)
+    # Resolved QuantizationArgs for weight quantization simulation
+    _weight_args: Optional[QuantizationArgs] = PrivateAttr(None)
 
     @property
     def resolved_targets(self) -> Set[str]:
@@ -174,10 +309,84 @@ class AWQModifier(Modifier):
             return {self.targets}
         return set(self.targets) if self.targets else {"Linear"}
 
+    @field_validator("scheme", mode="before")
+    @classmethod
+    def validate_scheme(
+        cls, value: Optional[Union[str, Dict[str, Any]]]
+    ) -> Optional[Union[str, Dict[str, Any]]]:
+        """Validate that scheme is either a preset name or a valid dict."""
+        if value is None:
+            return value
+
+        if isinstance(value, str) and not is_preset_scheme(value):
+            raise ValueError(
+                f"`scheme` must either be a preset scheme name or a dictionary. "
+                f"Got string '{value}' which is not a known preset. "
+                f"Available presets include: W4A16, W4A16_ASYM, W8A8, etc."
+            )
+
+        if isinstance(value, dict):
+            for scheme_name in value.keys():
+                if not is_preset_scheme(scheme_name):
+                    raise ValueError(
+                        f"Scheme key '{scheme_name}' is not a known preset scheme. "
+                        f"Available presets include: W4A16, W4A16_ASYM, W8A8, etc."
+                    )
+
+        return value
+
+    @field_validator("duo_scaling")
+    @classmethod
+    def validate_duo_scaling(cls, v):
+        """Validate that duo_scaling is either True, False, or 'both' (lowercase)"""
+        if v not in (True, False, "both"):
+            raise ValueError(f"duo_scaling must be True, False, or 'both', got {v!r}")
+        return v
+
+    def _resolve_weight_args(self) -> Optional[QuantizationArgs]:
+        """
+        Resolve the scheme or config_groups into a QuantizationArgs object
+        for use in the grid search quantization simulation.
+
+        Returns the weight QuantizationArgs from the first config group,
+        or None if no scheme is specified.
+        """
+        if self.scheme is None and self.config_groups is None:
+            return None
+
+        if self.scheme is not None and self.config_groups is not None:
+            raise ValueError("Please specify either `scheme` or `config_groups`, not both")
+
+        # Resolve scheme to config_groups
+        config_groups = self.config_groups
+        if self.scheme is not None:
+            scheme = self.scheme
+            targets = [self.targets] if isinstance(self.targets, str) else self.targets
+
+            if isinstance(scheme, str) and is_preset_scheme(scheme):
+                scheme = {scheme: targets}
+
+            config_groups = {}
+            for idx, key in enumerate(scheme.keys() if isinstance(scheme, dict) else []):
+                if is_preset_scheme(key):
+                    scheme_obj = preset_name_to_scheme(key, scheme[key])
+                else:
+                    scheme_obj = QuantizationScheme.model_validate(
+                        {"targets": scheme[key], **scheme}
+                    )
+                config_groups[f"group_{idx}"] = scheme_obj
+
+        if config_groups is None or len(config_groups) == 0:
+            return None
+
+        # Get weight args from the first config group
+        first_group = next(iter(config_groups.values()))
+        return first_group.weights
+
     def on_initialize(self, state: State, **kwargs) -> bool:
         """
         Initialize AWQ on the given state
-        Resolve mappings, cache module kwargs
+        Resolve mappings, resolve scheme to _weight_args, cache module kwargs
 
         :param state: state to run AWQ on
         :return: True on a successful run, False otherwise
@@ -204,6 +413,35 @@ class AWQModifier(Modifier):
                 # (no offloading by default)
                 self.offload_device = None
 
+        # Resolve scheme to _weight_args for quantization simulation
+        self._weight_args = self._resolve_weight_args()
+
+        if self._weight_args is not None:
+            logger.info(
+                f"AWQModifier will use quantization simulation with "
+                f"num_bits={self._weight_args.num_bits}, "
+                f"strategy={self._weight_args.strategy}, "
+                f"group_size={self._weight_args.group_size}, "
+                f"symmetric={self._weight_args.symmetric}"
+            )
+        else:
+            logger.info(
+                "AWQModifier running without quantization simulation. "
+                "Grid search will use FP-only smoothing. "
+                "For best results, provide a `scheme` argument matching "
+                "your subsequent QuantizationModifier or GPTQModifier."
+            )
+
+        # Validate duo_scaling with strategy
+        if self._weight_args is not None and self.duo_scaling is not False:
+            if self._weight_args.strategy == QuantizationStrategy.TENSOR:
+                raise ValueError(
+                    "duo_scaling is only supported with per-channel "
+                    "quantization strategies (group or channel), but found "
+                    "TENSOR strategy. Please set duo_scaling=False or use a "
+                    "per-channel quantization strategy."
+                )
+
         self._set_resolved_mappings(state.model)
 
         return True
@@ -220,53 +458,6 @@ class AWQModifier(Modifier):
                 "cannot be properly aligned with this dispatch. Please either "
                 "disable token masking or exclude the up_proj -> down_proj mapping "
                 "for MoE layers from the AWQ configuration."
-            )
-
-        # Check if any targeted module has quantization_scheme attached
-        # (attached by a quantization modifier like QuantizationModifier
-        # or GPTQModifier)
-        # Note: The quantization modifier's on_initialize must run BEFORE
-        # AWQ's on_start for the quantization_scheme to be available.
-        # This is ensured by proper recipe ordering:
-        # [AWQModifier(...), QuantizationModifier(...)]
-        has_quant_scheme = False
-        ignore_list = self.ignore or []
-        for _, module in match_named_modules(
-            state.model, self.resolved_targets, ignore_list
-        ):
-            if hasattr(module, "quantization_scheme"):
-                has_quant_scheme = True
-                break
-
-        if has_quant_scheme:
-            # Validate that duo_scaling is only used with per-channel
-            # quantization. This validation happens here because
-            # quantization_scheme is attached by the quantization modifier's
-            # on_initialize, which runs before this on_start
-            if self.duo_scaling is not False:
-                for _, module in match_named_modules(
-                    state.model, self.resolved_targets, ignore_list
-                ):
-                    if (
-                        hasattr(module, "quantization_scheme")
-                        and hasattr(module.quantization_scheme, "weights")
-                        and module.quantization_scheme.weights.strategy
-                        == QuantizationStrategy.TENSOR
-                    ):
-                        raise ValueError(
-                            "duo_scaling is only supported with per-channel "
-                            "quantization strategies (group or channel), but found "
-                            "TENSOR strategy. Please set duo_scaling=False or use a "
-                            "per-channel quantization strategy."
-                        )
-        else:
-            # No quantization scheme found - AWQ smoothing will still work but
-            # the grid search in _compute_best_scale will be limited
-            logger.info(
-                "No quantization_scheme found on model modules. AWQ will perform "
-                "smoothing using activation statistics only. For full quantization "
-                "support, ensure QuantizationModifier or GPTQModifier is stacked "
-                "after AWQModifier in the recipe."
             )
 
         # AWQ performs forward passes during _apply_smoothing
@@ -630,12 +821,12 @@ class AWQModifier(Modifier):
         Select best scales for a given mapping in a grid search.
         Best scales minimize MSE loss of (quantized) weight outputs vs fp16_outputs.
 
-        When stacked with a quantization modifier, uses quantization simulation
-        (full AWQ objective). When used standalone, falls back to FP-only smoothing
-        with activation-only scaling.
+        When a scheme is provided to AWQModifier, uses pure mathematical quantization
+        simulation (full AWQ objective). When no scheme is provided, falls back to
+        FP-only smoothing with activation-only scaling.
 
-        L(s) = || Q(W * s)(s^-1 * X) - WX ||   [with quant modifier]
-        L(s) = || (W * s)(s^-1 * X) - WX ||     [standalone fallback]
+        L(s) = || Q(W * s)(s^-1 * X) - WX ||   [with scheme]
+        L(s) = || (W * s)(s^-1 * X) - WX ||     [without scheme]
         """
         history = []
         best_ratio = -1
@@ -646,24 +837,15 @@ class AWQModifier(Modifier):
         device = get_execution_device(mapping.parent)
         x_mean = self._smooth_activation_means[mapping.smooth_name][0].to(device)
 
-        # Determine which balance layers have quantization schemes attached
-        # (attached by QuantizationModifier.on_initialize when stacked)
-        balance_layers_with_scheme = [
-            layer
-            for layer in mapping.balance_layers
-            if hasattr(layer, "quantization_scheme")
-            and hasattr(layer.quantization_scheme, "weights")
-        ]
-
-        # Standalone mode: no quantization schemes available
+        # Standalone mode: no quantization args provided to AWQModifier
         # Fall back to activation-only scaling (duo_scaling forced off)
-        standalone_mode = len(balance_layers_with_scheme) == 0
+        standalone_mode = self._weight_args is None
         if standalone_mode:
             logger.warning(
-                f"No quantization_scheme found on balance layers for "
-                f"{mapping.smooth_name}. Running grid search in FP-only mode "
-                "(activation-only scaling). For best results, stack AWQModifier "
-                "with QuantizationModifier or GPTQModifier."
+                f"No scheme provided to AWQModifier for {mapping.smooth_name}. "
+                "Running grid search in FP-only mode (activation-only scaling). "
+                "For best results, provide a `scheme` argument matching your "
+                "subsequent QuantizationModifier or GPTQModifier."
             )
             effective_duo_scaling = False
         else:
@@ -671,7 +853,9 @@ class AWQModifier(Modifier):
 
         # Compute weight means only if duo_scaling is active
         if effective_duo_scaling is not False:
-            w_mean = self._compute_layer_means(mapping.balance_layers).to(device)
+            w_mean = self._compute_layer_means(
+                mapping.balance_layers, self._weight_args
+            ).to(device)
 
         # Grid search configuration
         match effective_duo_scaling:
@@ -682,108 +866,66 @@ class AWQModifier(Modifier):
                 n_grid = self.n_grid
                 duo_scalings = [effective_duo_scaling]
 
-        # In standalone mode: simple loop, no observer patching needed
-        # In stacked mode: patch observers with memoryless_minmax for clean grid search
-        context = (
-            patch_attrs(
-                balance_layers_with_scheme,
-                "weight_observer",
-                [
-                    Observer.load_from_registry(
-                        "memoryless_minmax",
-                        base_name="weight",
-                        args=layer.quantization_scheme.weights,
-                        module=layer,
-                    )
-                    for layer in balance_layers_with_scheme
-                ],
-            )
-            if not standalone_mode
-            else contextlib.nullcontext()
+        total_iterations = n_grid * len(duo_scalings)
+        pbar = tqdm(
+            product(range(n_grid), duo_scalings),
+            total=total_iterations,
+            desc=f"Grid search for {mapping.smooth_name}",
+            leave=False,
         )
 
-        with context:
-            total_iterations = n_grid * len(duo_scalings)
-            pbar = tqdm(
-                product(range(n_grid), duo_scalings),
-                total=total_iterations,
-                desc=f"Grid search for {mapping.smooth_name}",
-                leave=False,
-            )
+        for grid_idx, use_duo_scaling in pbar:
+            ratio = grid_idx / n_grid
 
-            for grid_idx, use_duo_scaling in pbar:
-                ratio = grid_idx / n_grid
+            # Compute candidate scales
+            if use_duo_scaling:
+                scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(
+                    min=1e-4
+                )
+            else:
+                scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
 
-                # Compute candidate scales
-                if use_duo_scaling:
-                    scales = (x_mean.pow(ratio) / (w_mean.pow(1 - ratio) + 1e-4)).clamp(
-                        min=1e-4
+            scales = scales / (scales.max() * scales.min()).sqrt()
+            scales[torch.isinf(scales)] = 1
+            scales[torch.isnan(scales)] = 1
+            _scalesview = scales.view(1, -1).to(device)
+
+            # Apply scaled + (optionally) quantized weights
+            for layer in mapping.balance_layers:
+                scaled_weight = (
+                    orig_layer_weights[layer].to(_scalesview.device) * _scalesview
+                )
+
+                if self._weight_args is not None:
+                    # Full AWQ: simulate quantization error Q(W*s)/s using pure math
+                    # No PyTorch Observers needed - just mathematical simulation
+                    quantized_weight = pseudo_quantize_tensor(
+                        scaled_weight, self._weight_args
+                    )
+                    layer.weight.data = (quantized_weight / _scalesview).to(
+                        layer.weight.dtype
                     )
                 else:
-                    scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
+                    # Standalone fallback: FP smoothing only
+                    layer.weight.data.copy_(scaled_weight)
 
-                scales = scales / (scales.max() * scales.min()).sqrt()
-                scales[torch.isinf(scales)] = 1
-                scales[torch.isnan(scales)] = 1
-                _scalesview = scales.view(1, -1).to(device)
+            # Measure error
+            int_w_outputs = self._run_samples(mapping.parent)
+            loss = self._compute_loss(fp16_outputs, int_w_outputs)
+            del int_w_outputs
 
-                # Apply scaled + (optionally) quantized weights
-                for layer in mapping.balance_layers:
-                    scaled_weight = (
-                        orig_layer_weights[layer].to(_scalesview.device) * _scalesview
-                    )
+            if initial_error is None:
+                initial_error = loss
 
-                    if not standalone_mode and layer in balance_layers_with_scheme:
-                        # Full AWQ: simulate quantization error Q(W*s)/s
-                        w_qscheme = layer.quantization_scheme.weights
-                        layer.weight.data.copy_(scaled_weight)
+            history.append(
+                {"ratio": ratio, "duo_scaling": use_duo_scaling, "error": loss}
+            )
+            if loss < best_error:
+                best_error = loss
+                best_ratio = ratio
+                best_scales = scales.clone()
 
-                        should_calculate_gparam = (
-                            w_qscheme.strategy == QuantizationStrategy.TENSOR_GROUP
-                        )
-                        call_observer(
-                            layer,
-                            "weight",
-                            layer.weight,
-                            should_calculate_gparam=should_calculate_gparam,
-                        )
-                        layer.weight.data = (
-                            forward_quantize(layer, layer.weight, "weight", w_qscheme)
-                            / _scalesview
-                        ).to(layer.weight.dtype)
-                    else:
-                        # Standalone fallback: FP smoothing only
-                        layer.weight.data.copy_(scaled_weight)
-
-                # Handle TENSOR_GROUP fused global scales
-                if (
-                    not standalone_mode
-                    and balance_layers_with_scheme
-                    and all(
-                        getattr(layer.quantization_scheme.weights, "strategy", None)
-                        == QuantizationStrategy.TENSOR_GROUP
-                        for layer in balance_layers_with_scheme
-                    )
-                ):
-                    update_fused_layer_weight_global_scales(mapping.parent)
-
-                # Measure error
-                int_w_outputs = self._run_samples(mapping.parent)
-                loss = self._compute_loss(fp16_outputs, int_w_outputs)
-                del int_w_outputs
-
-                if initial_error is None:
-                    initial_error = loss
-
-                history.append(
-                    {"ratio": ratio, "duo_scaling": use_duo_scaling, "error": loss}
-                )
-                if loss < best_error:
-                    best_error = loss
-                    best_ratio = ratio
-                    best_scales = scales.clone()
-
-                pbar.set_postfix({"best_error": f"{best_error:.3e}"})
+            pbar.set_postfix({"best_error": f"{best_error:.3e}"})
 
         if best_ratio == -1:
             logger.debug(history)
@@ -910,14 +1052,26 @@ class AWQModifier(Modifier):
         return False
 
     @staticmethod
-    def _compute_layer_means(layers: list[Module]) -> torch.Tensor:
+    def _compute_layer_means(
+        layers: list[Module], weight_args: Optional[QuantizationArgs]
+    ) -> torch.Tensor:
         """
         Compute per-channel/group/block/tensor mean of normalised weights
-        for all passed in layers taking into account the quantization_scheme.
+        for all passed in layers taking into account the quantization args.
 
         To minimize memory requirements, layers are reduced to a running total
             of sums and counts when calculating mean
+
+        :param layers: List of layers to compute weight means for
+        :param weight_args: QuantizationArgs to use for determining chunk size
+        :return: Tensor of per-channel weight means
         """
+        if weight_args is None:
+            raise ValueError(
+                "weight_args must be provided to _compute_layer_means. "
+                "This should not happen when duo_scaling is enabled."
+            )
+
         # to calculate mean without having to carry full population
         weight_total_count = 0
         weight_total_sum = 0
@@ -932,15 +1086,7 @@ class AWQModifier(Modifier):
             weight = layer.weight.clone()
             orig_shape = weight.shape
 
-            q_args = getattr_chain(layer, "quantization_scheme.weights", None)
-            if not q_args:
-                logger.warning(
-                    "Unable to find quantization scheme for "
-                    f"targeted layer {type(layer)}, skipping"
-                )
-                continue
-
-            match q_args.strategy:
+            match weight_args.strategy:
                 # chunk size is the size of the size of the
                 # set of elements that get quantized together
                 case QuantizationStrategy.TENSOR:
@@ -948,9 +1094,9 @@ class AWQModifier(Modifier):
                 case QuantizationStrategy.CHANNEL:
                     chunk_size = weight.size(1)
                 case QuantizationStrategy.GROUP | QuantizationStrategy.TENSOR_GROUP:
-                    chunk_size = q_args.group_size
+                    chunk_size = weight_args.group_size
                 case QuantizationStrategy.BLOCK:
-                    block_height, block_width = q_args.block_structure
+                    block_height, block_width = weight_args.block_structure
                     weight = (  # (row, col) = (num_H*block_H, num_W*block_W)
                         weight.unflatten(0, (-1, block_height))
                         .unflatten(-1, (-1, block_width))
@@ -965,7 +1111,7 @@ class AWQModifier(Modifier):
             weight.abs_()
             weight.div_(weight.amax(dim=1, keepdim=True) + 1e-6)
             # Reshape back to original dimensions
-            if q_args.strategy == QuantizationStrategy.BLOCK:
+            if weight_args.strategy == QuantizationStrategy.BLOCK:
                 weight = weight.view(intermediate_shape).transpose(1, 2)
 
             # back to (rows, cols)
@@ -976,14 +1122,6 @@ class AWQModifier(Modifier):
             weight_total_sum += weight_sum
 
         return weight_total_sum / weight_total_count
-
-    @field_validator("duo_scaling")
-    @classmethod
-    def validate_duo_scaling(cls, v):
-        """Validate that duo_scaling is either True, False, or 'both' (lowercase)"""
-        if v not in (True, False, "both"):
-            raise ValueError(f"duo_scaling must be True, False, or 'both', got {v!r}")
-        return v
 
 
 def _check_layers_are_compatible(

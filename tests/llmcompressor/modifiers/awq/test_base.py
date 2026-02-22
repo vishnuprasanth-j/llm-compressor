@@ -513,18 +513,11 @@ def test_compute_layer_means(n_balance_layers, n_input_features, strategy, group
         torch.nn.Linear(n_input_features, 10) for _ in range(n_balance_layers)
     ]
 
-    for balance_layer in balance_layers:
-        setattr(
-            balance_layer,
-            "quantization_scheme",
-            QuantizationScheme(
-                targets=["Linear"],
-                weights=QuantizationArgs(
-                    strategy=strategy,
-                    group_size=group_size,
-                ),
-            ),
-        )
+    # Create weight_args directly instead of attaching quantization_scheme to layers
+    weight_args = QuantizationArgs(
+        strategy=strategy,
+        group_size=group_size,
+    )
 
     match strategy:
         case QuantizationStrategy.GROUP | QuantizationStrategy.TENSOR_GROUP:
@@ -536,7 +529,7 @@ def test_compute_layer_means(n_balance_layers, n_input_features, strategy, group
 
     auto_awq_means = _auto_awq_normalize(balance_layers, group_size_arg).mean(0)
 
-    llmc_awq_means = AWQModifier._compute_layer_means(balance_layers).to(
+    llmc_awq_means = AWQModifier._compute_layer_means(balance_layers, weight_args).to(
         auto_awq_means.dtype
     )
 
@@ -556,24 +549,16 @@ def test_compute_layer_means_does_not_modify_weights():
     n_input_features = 16
     layers = [torch.nn.Linear(n_input_features, 8) for _ in range(n_layers)]
 
-    # Set up quantization scheme for channel-wise quantization
-    for layer in layers:
-        setattr(
-            layer,
-            "quantization_scheme",
-            QuantizationScheme(
-                targets=["Linear"],
-                weights=QuantizationArgs(
-                    strategy=QuantizationStrategy.CHANNEL,
-                ),
-            ),
-        )
+    # Create weight_args directly for channel-wise quantization
+    weight_args = QuantizationArgs(
+        strategy=QuantizationStrategy.CHANNEL,
+    )
 
     # Store copies of original weights before calling _compute_layer_means
     original_weights = [layer.weight.clone() for layer in layers]
 
     # Call _compute_layer_means which should NOT modify the original weights
-    AWQModifier._compute_layer_means(layers)
+    AWQModifier._compute_layer_means(layers, weight_args)
 
     # Verify that the original weights remain unchanged
     for i, layer in enumerate(layers):
@@ -620,19 +605,15 @@ def test_block_strategy_compute_layer_means(rows, cols, block_height, block_widt
     Confirm our logic to compute layer means works for BLOCK quantization
     """
     lin = torch.nn.Linear(cols, rows)
-    setattr(
-        lin,
-        "quantization_scheme",
-        QuantizationScheme(
-            targets=["Linear"],
-            weights=QuantizationArgs(
-                strategy=QuantizationStrategy.BLOCK,
-                block_structure=[block_height, block_width],
-            ),
-        ),
+    
+    # Create weight_args directly for block quantization
+    weight_args = QuantizationArgs(
+        strategy=QuantizationStrategy.BLOCK,
+        block_structure=[block_height, block_width],
     )
+    
     # main
-    llmc_awq_means = AWQModifier._compute_layer_means([lin])
+    llmc_awq_means = AWQModifier._compute_layer_means([lin], weight_args)
 
     # ref
     num_heights = rows // block_height
@@ -656,8 +637,6 @@ def test_block_strategy_compute_layer_means(rows, cols, block_height, block_widt
     # we first reshape the weight such that it is effectively per-channel quantization
     # so that we can compare to the existing _auto_awq_normalize function
     orig_shape = lin.weight.shape
-    q_args = lin.quantization_scheme.weights
-    block_height, block_width = q_args.block_structure
     lin.weight.data = (  # (row, col)
         lin.weight.unflatten(0, (-1, block_height))  # = (num_H*block_H, num_W*block_W)
         .unflatten(-1, (-1, block_width))
@@ -746,3 +725,156 @@ def test_mismatched_ignore_warning():
 
     # Should warn but not raise
     _validate_awq_quantization_stacking([awq, quant])
+
+
+@pytest.mark.unit
+def test_scheme_mismatch_error():
+    """Error when AWQ and quant modifier have mismatched schemes"""
+    from llmcompressor.modifiers.quantization import QuantizationModifier
+    from llmcompressor.recipe.recipe import _validate_awq_quantization_stacking
+
+    awq = AWQModifier(
+        mappings=[
+            AWQMapping("re:.*layernorm", ["re:.*q_proj"]),
+        ],
+        scheme="W4A16",  # Different scheme
+    )
+    quant = QuantizationModifier(
+        targets="Linear",
+        scheme="W8A8",  # Different scheme!
+    )
+
+    # Should raise ValueError for scheme mismatch
+    with pytest.raises(ValueError, match="does not match"):
+        _validate_awq_quantization_stacking([awq, quant])
+
+
+@pytest.mark.unit
+def test_scheme_match_no_error():
+    """No error when AWQ and quant modifier have matching schemes"""
+    from llmcompressor.modifiers.quantization import QuantizationModifier
+    from llmcompressor.recipe.recipe import _validate_awq_quantization_stacking
+
+    awq = AWQModifier(
+        mappings=[
+            AWQMapping("re:.*layernorm", ["re:.*q_proj"]),
+        ],
+        scheme="W4A16_ASYM",
+    )
+    quant = QuantizationModifier(
+        targets="Linear",
+        scheme="W4A16_ASYM",  # Same scheme
+    )
+
+    # Should not raise
+    _validate_awq_quantization_stacking([awq, quant])
+
+
+@pytest.mark.unit
+def test_awq_without_scheme_info_message():
+    """Info message when AWQ has no scheme but quant modifier exists"""
+    from llmcompressor.modifiers.quantization import QuantizationModifier
+    from llmcompressor.recipe.recipe import _validate_awq_quantization_stacking
+
+    awq = AWQModifier(
+        mappings=[
+            AWQMapping("re:.*layernorm", ["re:.*q_proj"]),
+        ],
+        # No scheme specified
+    )
+    quant = QuantizationModifier(
+        targets="Linear",
+        scheme="W4A16",
+    )
+
+    # Should not raise, but should log info message
+    _validate_awq_quantization_stacking([awq, quant])
+
+
+@pytest.mark.unit
+@torch.no_grad
+def test_pseudo_quantize_tensor_symmetric():
+    """Test pseudo_quantize_tensor with symmetric quantization"""
+    from llmcompressor.modifiers.awq.base import pseudo_quantize_tensor
+
+    # Create a simple weight tensor
+    weight = torch.randn(4, 8)
+
+    # Test symmetric group quantization
+    weight_args = QuantizationArgs(
+        num_bits=4,
+        symmetric=True,
+        strategy=QuantizationStrategy.GROUP,
+        group_size=8,
+    )
+
+    quantized = pseudo_quantize_tensor(weight, weight_args)
+
+    # Check that output has same shape
+    assert quantized.shape == weight.shape
+
+    # Check that quantization introduces some error (not identity)
+    assert not torch.allclose(quantized, weight, atol=1e-5)
+
+
+@pytest.mark.unit
+@torch.no_grad
+def test_pseudo_quantize_tensor_asymmetric():
+    """Test pseudo_quantize_tensor with asymmetric quantization"""
+    from llmcompressor.modifiers.awq.base import pseudo_quantize_tensor
+
+    # Create a simple weight tensor
+    weight = torch.randn(4, 8)
+
+    # Test asymmetric channel quantization
+    weight_args = QuantizationArgs(
+        num_bits=8,
+        symmetric=False,
+        strategy=QuantizationStrategy.CHANNEL,
+    )
+
+    quantized = pseudo_quantize_tensor(weight, weight_args)
+
+    # Check that output has same shape
+    assert quantized.shape == weight.shape
+
+    # Check that quantization introduces some error (not identity)
+    assert not torch.allclose(quantized, weight, atol=1e-5)
+
+
+@pytest.mark.unit
+@torch.no_grad
+def test_pseudo_quantize_tensor_channel_strategy():
+    """Test pseudo_quantize_tensor with per-channel quantization"""
+    from llmcompressor.modifiers.awq.base import pseudo_quantize_tensor
+
+    weight = torch.randn(4, 16)
+
+    weight_args = QuantizationArgs(
+        num_bits=4,
+        symmetric=True,
+        strategy=QuantizationStrategy.CHANNEL,
+    )
+
+    quantized = pseudo_quantize_tensor(weight, weight_args)
+
+    assert quantized.shape == weight.shape
+
+
+@pytest.mark.unit
+@torch.no_grad
+def test_pseudo_quantize_tensor_tensor_strategy():
+    """Test pseudo_quantize_tensor with per-tensor quantization"""
+    from llmcompressor.modifiers.awq.base import pseudo_quantize_tensor
+
+    weight = torch.randn(4, 16)
+
+    weight_args = QuantizationArgs(
+        num_bits=8,
+        symmetric=True,
+        strategy=QuantizationStrategy.TENSOR,
+    )
+
+    quantized = pseudo_quantize_tensor(weight, weight_args)
+
+    assert quantized.shape == weight.shape
